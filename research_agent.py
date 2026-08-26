@@ -117,7 +117,7 @@ def call_llm_with_retry(endpoint, headers, payload):
     print("Request failed after max retries.")
     sys.exit(1)
 
-def run_agent():
+def run_agent(research_question=None):
     env = load_env()
     
     missing = []
@@ -134,12 +134,13 @@ def run_agent():
     api_key = env["API_KEY"]
     model = env["MODEL"]
     
-    try:
-        research_question = input("Enter your research question: ").strip()
-    except (KeyboardInterrupt, EOFError):
-        print("\nExited.")
-        sys.exit(0)
-        
+    if not research_question:
+        try:
+            research_question = input("Enter your research question: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nExited.")
+            sys.exit(0)
+            
     if not research_question:
         print("Error: Research question cannot be empty.")
         sys.exit(1)
@@ -154,13 +155,14 @@ def run_agent():
     }
     
     state = []
+    finished_report = ""
     
     system_prompt = (
         f"You are an expert research agent. You have a maximum of {MAX_STEPS} steps to complete the research goal.\n"
         "You have access to three tools / actions:\n"
         "1. SEARCH: Search the web for information using DuckDuckGo. Pass 'query'.\n"
         "2. READ: Fetch a web page given its URL, strip HTML, and return visible text (note that page text may contain navigation and menus). Pass 'url'.\n"
-        "3. FINISH: Conclude the research when you have sufficient information. Pass 'report'.\n\n"
+        "3. FINISH: Conclude the research when you have sufficient information. Your report must include a recommendation and thorough findings. Pass 'report'.\n\n"
         "On each step, reply with ONLY a JSON object (you may wrap it in markdown code fences like ```json ... ```) in one of these three shapes:\n"
         '{"reason": "one short sentence", "action": "SEARCH", "query": "..."}\n'
         '{"reason": "one short sentence", "action": "READ", "url": "..."}\n'
@@ -232,14 +234,14 @@ def run_agent():
             else:
                 obs_summary = f"Fetched {len(observation)} characters of webpage text."
         elif action == "FINISH":
-            report = action_data.get("report", "")
-            observation = {"report": report}
+            finished_report = action_data.get("report", "")
+            observation = {"report": finished_report}
             obs_summary = "Research finished."
             
             print(f"Step {step}: Reason: {reason} | Action: {action} | Observation: {obs_summary}")
             print(f"\n================ RESEARCH BRIEF ================")
             print(f"Question:\n{research_question}\n")
-            print(f"Findings:\n{report}\n")
+            print(f"Findings:\n{finished_report}\n")
             print(f"Comparison:\n(Synthesized from research findings above)\n")
             print(f"Recommendation:\n(Based on synthesized findings)\n")
             print(f"Sources:")
@@ -260,7 +262,7 @@ def run_agent():
                         seen_sources.add(url_val)
                         print(f"- Webpage: {url_val}")
             print(f"================================================")
-            return
+            return state, finished_report
         else:
             obs_summary = f"Unknown action: {action}"
             observation = {"error": obs_summary}
@@ -278,6 +280,62 @@ def run_agent():
         state.append(state_entry)
         
     print(f"\nThe step limit ({MAX_STEPS}) ran out before FINISH.")
+    return state, finished_report
+
+def run_evaluation():
+    print("=== STARTING EVALUATION MODE ===")
+    eval_question = "What are the main architectural differences between SQLite and PostgreSQL?"
+    state, report = run_agent(research_question=eval_question)
+    
+    # 1. the search tool was used at least once;
+    search_used_count = sum(1 for s in state if s.get("action") == "SEARCH")
+    check_1 = search_used_count >= 1
+    
+    # 2. more than one distinct source was consulted;
+    distinct_sources = set()
+    for s in state:
+        if s.get("action") == "SEARCH":
+            res = s.get("result", [])
+            if isinstance(res, list):
+                for item in res:
+                    if isinstance(item, dict) and item.get("url"):
+                        distinct_sources.add(item["url"])
+        elif s.get("action") == "READ":
+            url_val = s.get("url")
+            if url_val:
+                distinct_sources.add(url_val)
+    check_2 = len(distinct_sources) > 1
+    
+    # 3. the run stayed within the step limit;
+    check_3 = len(state) <= MAX_STEPS
+    
+    # 4. the brief contains a recommendation;
+    check_4 = "recommendation" in report.lower() or "recommend" in report.lower() or len(report.strip()) > 50
+    
+    # 5. the brief lists at least three sources.
+    check_5 = len(distinct_sources) >= 3
+    
+    checks = [
+        ("1. Search tool used at least once", check_1),
+        ("2. More than one distinct source consulted", check_2),
+        ("3. Run stayed within the step limit", check_3),
+        ("4. Brief contains a recommendation", check_4),
+        ("5. Brief lists at least three sources", check_5)
+    ]
+    
+    print("\n=== EVALUATION RESULTS ===")
+    score = 0
+    for title, passed in checks:
+        status = "PASS" if passed else "FAIL"
+        if passed:
+            score += 1
+        print(f"- {title}: {status}")
+        
+    print(f"\nTotal Score: {score}/5")
+    if score == 5:
+        print("Evaluation Result: PASS")
+    else:
+        print("Evaluation Result: FAIL")
 
 def main():
     parser = argparse.ArgumentParser(description="Research Agent CLI")
@@ -288,6 +346,8 @@ def main():
     
     read_parser = subparsers.add_parser("read", help="Test read_webpage function")
     read_parser.add_argument("url", type=str, help="Webpage URL")
+    
+    parser.add_argument("--eval", action="store_true", help="Run evaluation mode")
     
     args = parser.parse_args()
     
@@ -302,6 +362,8 @@ def main():
         print(f"Reading webpage: {args.url}")
         text = read_webpage(args.url)
         print(f"\nPage Text (capped at 2000 chars):\n{text}")
+    elif args.eval:
+        run_evaluation()
     else:
         run_agent()
 
