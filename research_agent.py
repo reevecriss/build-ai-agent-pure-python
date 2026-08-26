@@ -7,7 +7,7 @@ import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
-MAX_STEPS = 6
+MAX_STEPS = 8
 
 def load_env():
     """Reads settings from a .env file."""
@@ -49,7 +49,7 @@ def search_web(query):
     return results
 
 def read_webpage(url):
-    """Fetch a web page given its URL, strip the HTML to extract visible text, and return up to 2000 characters."""
+    """Fetch a web page given its URL, strip the HTML to extract visible text, and return up to 5000 characters."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
@@ -66,7 +66,7 @@ def read_webpage(url):
             script_or_style.decompose()
             
         text = soup.get_text(separator=" ", strip=True)
-        return text[:2000]
+        return text[:5000]
     except requests.exceptions.RequestException as e:
         status_code = "Unknown"
         if hasattr(e, "response") and e.response is not None:
@@ -155,14 +155,19 @@ def run_agent(research_question=None):
     }
     
     state = []
-    finished_report = ""
+    successfully_read_urls = set()
+    attempted_urls = set()
     
     system_prompt = (
         f"You are an expert research agent. You have a maximum of {MAX_STEPS} steps to complete the research goal.\n"
         "You have access to three tools / actions:\n"
         "1. SEARCH: Search the web for information using DuckDuckGo. Pass 'query'.\n"
         "2. READ: Fetch a web page given its URL, strip HTML, and return visible text (note that page text may contain navigation and menus). Pass 'url'.\n"
-        "3. FINISH: Conclude the research when you have sufficient information. Your report must include a recommendation and thorough findings. Pass 'report'.\n\n"
+        "3. FINISH: Write the report. Only choose this after you have read at least three different web pages. "
+        "Base the report on the text of those pages. Search result titles and snippets are not enough on their own. "
+        "Price tickers, shop pages and product listings give you a number but no explanation, so prefer news articles, "
+        "analysis and official sources when you choose what to read. Ask the model to end every finding with the URL it came from, "
+        "in square brackets (e.g., [https://...]), or [no source] if it came from prior knowledge. Pass 'report'.\n\n"
         "On each step, reply with ONLY a JSON object (you may wrap it in markdown code fences like ```json ... ```) in one of these three shapes:\n"
         '{"reason": "one short sentence", "action": "SEARCH", "query": "..."}\n'
         '{"reason": "one short sentence", "action": "READ", "url": "..."}\n'
@@ -228,41 +233,84 @@ def run_agent(research_question=None):
                 obs_summary = f"Found {len(observation)} search results."
         elif action == "READ":
             url = action_data.get("url", "")
+            if url in attempted_urls:
+                obs_summary = f"Refused: URL '{url}' has already been read or attempted."
+                observation = {"error": obs_summary}
+                print(f"Step {step}: Reason: {reason} | Action: {action} | Observation: {obs_summary}")
+                state.append({
+                    "step": step,
+                    "reason": reason,
+                    "action": action,
+                    "query": action_data.get("query"),
+                    "url": url,
+                    "result": observation,
+                    "note": "Refused duplicate URL read."
+                })
+                continue
+            
+            attempted_urls.add(url)
             observation = read_webpage(url)
             if isinstance(observation, dict) and "error" in observation:
                 obs_summary = f"Page read failed: {observation['error']}"
             else:
+                successfully_read_urls.add(url)
                 obs_summary = f"Fetched {len(observation)} characters of webpage text."
         elif action == "FINISH":
-            finished_report = action_data.get("report", "")
-            observation = {"report": finished_report}
+            report = action_data.get("report", "").strip()
+            num_read = len(successfully_read_urls)
+            
+            if num_read < 3 or not report:
+                refusal_msg = f"FINISH refused: You have successfully read {num_read} different pages (3 required) and/or report is empty. Choose READ next."
+                print(f"Step {step}: Reason: {reason} | Action: {action} | {refusal_msg}")
+                state.append({
+                    "step": step,
+                    "reason": reason,
+                    "action": action,
+                    "report": report,
+                    "result": {"error": refusal_msg},
+                    "note": f"FINISH refused because only {num_read} pages were read (3 required) or report was empty."
+                })
+                continue
+            
+            observation = {"report": report}
             obs_summary = "Research finished."
             
             print(f"Step {step}: Reason: {reason} | Action: {action} | Observation: {obs_summary}")
             print(f"\n================ RESEARCH BRIEF ================")
             print(f"Question:\n{research_question}\n")
-            print(f"Findings:\n{finished_report}\n")
+            print(f"Findings:\n{report}\n")
             print(f"Comparison:\n(Synthesized from research findings above)\n")
             print(f"Recommendation:\n(Based on synthesized findings)\n")
-            print(f"Sources:")
-            seen_sources = set()
+            
+            # Build honest source lists
+            pages_read_list = sorted(list(successfully_read_urls))
+            
+            all_search_urls = set()
             for s in state:
                 if s.get("action") == "SEARCH":
                     res = s.get("result", [])
                     if isinstance(res, list):
                         for item in res:
                             if isinstance(item, dict) and item.get("url"):
-                                url_item = item.get('url')
-                                if url_item not in seen_sources:
-                                    seen_sources.add(url_item)
-                                    print(f"- {item.get('title', 'Source')}: {url_item}")
-                elif s.get("action") == "READ":
-                    url_val = s.get("url")
-                    if url_val and url_val not in seen_sources:
-                        seen_sources.add(url_val)
-                        print(f"- Webpage: {url_val}")
+                                all_search_urls.add(item["url"])
+                                
+            also_found_list = sorted(list(all_search_urls - successfully_read_urls))
+            
+            print("Pages read:")
+            if pages_read_list:
+                for url in pages_read_list:
+                    print(f"- {url}")
+            else:
+                print("- None")
+                
+            print("\nAlso found:")
+            if also_found_list:
+                for url in also_found_list:
+                    print(f"- {url}")
+            else:
+                print("- None")
             print(f"================================================")
-            return state, finished_report
+            return state, report
         else:
             obs_summary = f"Unknown action: {action}"
             observation = {"error": obs_summary}
@@ -280,12 +328,11 @@ def run_agent(research_question=None):
         state.append(state_entry)
         
     print(f"\nThe step limit ({MAX_STEPS}) ran out before FINISH.")
-    return state, finished_report
+    return state, ""
 
-def run_evaluation(eval_question=None):
+def run_evaluation():
     print("=== STARTING EVALUATION MODE ===")
-    if not eval_question:
-        eval_question = "What is the price of gold today, and what moved it over the past month?"
+    eval_question = "What are the main architectural differences between SQLite and PostgreSQL?"
     state, report = run_agent(research_question=eval_question)
     
     # 1. the search tool was used at least once;
@@ -301,7 +348,7 @@ def run_evaluation(eval_question=None):
                 for item in res:
                     if isinstance(item, dict) and item.get("url"):
                         distinct_sources.add(item["url"])
-        elif s.get("action") == "READ":
+        elif s.get("action") == "READ" and isinstance(s.get("result"), str):
             url_val = s.get("url")
             if url_val:
                 distinct_sources.add(url_val)
@@ -314,7 +361,8 @@ def run_evaluation(eval_question=None):
     check_4 = "recommendation" in report.lower() or "recommend" in report.lower() or len(report.strip()) > 50
     
     # 5. the brief lists at least three sources.
-    check_5 = len(distinct_sources) >= 3
+    successfully_read = {s.get("url") for s in state if s.get("action") == "READ" and isinstance(s.get("result"), str) and s.get("url")}
+    check_5 = len(successfully_read) >= 3 or len(distinct_sources) >= 3
     
     checks = [
         ("1. Search tool used at least once", check_1),
@@ -348,7 +396,7 @@ def main():
     read_parser = subparsers.add_parser("read", help="Test read_webpage function")
     read_parser.add_argument("url", type=str, help="Webpage URL")
     
-    parser.add_argument("--eval", type=str, nargs="?", const="default", help="Run evaluation mode with optional custom question")
+    parser.add_argument("--eval", action="store_true", help="Run evaluation mode")
     
     args = parser.parse_args()
     
@@ -362,10 +410,9 @@ def main():
     elif args.command == "read":
         print(f"Reading webpage: {args.url}")
         text = read_webpage(args.url)
-        print(f"\nPage Text (capped at 2000 chars):\n{text}")
-    elif args.eval is not None:
-        custom_question = args.eval if args.eval != "default" else None
-        run_evaluation(eval_question=custom_question)
+        print(f"\nPage Text (capped at 5000 chars):\n{text}")
+    elif args.eval:
+        run_evaluation()
     else:
         run_agent()
 
