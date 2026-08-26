@@ -348,7 +348,7 @@ def main():
     read_parser = subparsers.add_parser("read", help="Test read_webpage function")
     read_parser.add_argument("url", type=str, help="Webpage URL")
     
-    parser.add_argument("--eval", type=str, nargs="?", const=None, help="Run evaluation mode with optional custom question")
+    parser.add_argument("--eval", type=str, nargs="?", const="default", help="Run evaluation mode with optional custom question")
     
     args = parser.parse_args()
     
@@ -364,7 +364,8 @@ def main():
         text = read_webpage(args.url)
         print(f"\nPage Text (capped at 2000 chars):\n{text}")
     elif args.eval is not None:
-        run_evaluation(eval_question=args.eval)
+        custom_question = args.eval if args.eval != "default" else None
+        run_evaluation(eval_question=custom_question)
     else:
         run_agent()
 
