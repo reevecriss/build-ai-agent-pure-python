@@ -1,7 +1,10 @@
 import os
 import sys
 import time
+import argparse
 import requests
+from bs4 import BeautifulSoup
+from ddgs import DDGS
 
 def load_env():
     """Reads settings from a .env file."""
@@ -16,15 +19,60 @@ def load_env():
                     key, val = line.split("=", 1)
                     env_vars[key.strip()] = val.strip().strip("'\"")
                     
-    # Also check system environment variables as fallback
     for key in ["API_BASE_URL", "API_KEY", "MODEL"]:
         if os.getenv(key):
             env_vars[key] = os.getenv(key)
             
     return env_vars
 
-def main():
-    # 1. Read required settings from .env file
+def search_web(query):
+    """Search the web for information using DuckDuckGo and return up to 5 results with title, URL, and snippet."""
+    results = []
+    try:
+        with DDGS() as ddgs:
+            raw_results = ddgs.text(query, max_results=5)
+            for r in raw_results:
+                results.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("href", ""),
+                    "snippet": r.get("body", "")
+                })
+    except Exception as e:
+        status_code = getattr(e, "response", None)
+        status_code = getattr(status_code, "status_code", "Unknown")
+        print(f"Search failed | Status Code: {status_code} | URL/Query: {query} | Error: {e}")
+        return []
+    return results
+
+def read_webpage(url):
+    """Fetch a web page given its URL, strip the HTML to extract visible text, and return up to 2000 characters."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        if response.status_code >= 400:
+            print(f"Page fetch failed | Status Code: {response.status_code} | URL: {url}")
+            return ""
+        
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        for script_or_style in soup(["script", "style"]):
+            script_or_style.decompose()
+            
+        text = soup.get_text(separator=" ", strip=True)
+        return text[:2000]
+    except requests.exceptions.RequestException as e:
+        status_code = "Unknown"
+        if hasattr(e, "response") and e.response is not None:
+            status_code = e.response.status_code
+        print(f"Page fetch failed | Status Code: {status_code} | URL: {url} | Error: {e}")
+        return ""
+    except Exception as e:
+        print(f"Page fetch failed | Status Code: Unknown | URL: {url} | Error: {e}")
+        return ""
+
+def run_agent():
     env = load_env()
     
     missing = []
@@ -41,7 +89,6 @@ def main():
     api_key = env["API_KEY"]
     model = env["MODEL"]
     
-    # 2. Ask the user for a research question and print it back
     try:
         research_question = input("Enter your research question: ").strip()
     except (KeyboardInterrupt, EOFError):
@@ -54,7 +101,6 @@ def main():
         
     print(f"\nResearch Question: {research_question}\n")
     
-    # 3. Prepare API request
     endpoint = f"{api_base_url.rstrip('/')}/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -76,7 +122,6 @@ def main():
         try:
             response = requests.post(endpoint, headers=headers, json=payload, timeout=60)
             
-            # Handle Rate Limiting (429)
             if response.status_code == 429:
                 attempt += 1
                 if attempt > max_retries:
@@ -92,7 +137,6 @@ def main():
                 time.sleep(wait_time)
                 continue
                 
-            # Handle Server Errors (5xx)
             if 500 <= response.status_code < 600:
                 attempt += 1
                 if attempt > max_retries:
@@ -102,7 +146,6 @@ def main():
                 time.sleep(wait_time)
                 continue
                 
-            # Handle other HTTP status codes or success
             if response.status_code >= 400:
                 error_body = ""
                 try:
@@ -140,7 +183,6 @@ def main():
             pass
         sys.exit(1)
         
-    # 4. Parse response
     try:
         data = response.json()
     except Exception as e:
@@ -149,7 +191,6 @@ def main():
         print(f"Response Body: {response.text}")
         sys.exit(1)
         
-    # 5. Validate response structure
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
@@ -158,6 +199,32 @@ def main():
         sys.exit(1)
         
     print(f"Research Result:\n{content}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Research Agent CLI")
+    subparsers = parser.add_subparsers(dest="command", help="Subcommands")
+    
+    search_parser = subparsers.add_parser("search", help="Test search_web function")
+    search_parser.add_argument("query", type=str, help="Search query")
+    
+    read_parser = subparsers.add_parser("read", help="Test read_webpage function")
+    read_parser.add_argument("url", type=str, help="Webpage URL")
+    
+    args = parser.parse_args()
+    
+    if args.command == "search":
+        print(f"Searching web for: {args.query}")
+        results = search_web(args.query)
+        for i, res in enumerate(results, 1):
+            print(f"\n{i}. {res['title']}")
+            print(f"   URL: {res['url']}")
+            print(f"   Snippet: {res['snippet']}")
+    elif args.command == "read":
+        print(f"Reading webpage: {args.url}")
+        text = read_webpage(args.url)
+        print(f"\nPage Text (capped at 2000 chars):\n{text}")
+    else:
+        run_agent()
 
 if __name__ == "__main__":
     main()
