@@ -282,9 +282,10 @@ def run_agent(research_question=None):
     print(f"\nThe step limit ({MAX_STEPS}) ran out before FINISH.")
     return state, finished_report
 
-def run_evaluation():
+def run_evaluation(eval_question=None):
     print("=== STARTING EVALUATION MODE ===")
-    eval_question = "What are the main architectural differences between SQLite and PostgreSQL?"
+    if not eval_question:
+        eval_question = "What is the price of gold today, and what moved it over the past month?"
     state, report = run_agent(research_question=eval_question)
     
     # 1. the search tool was used at least once;
@@ -347,7 +348,7 @@ def main():
     read_parser = subparsers.add_parser("read", help="Test read_webpage function")
     read_parser.add_argument("url", type=str, help="Webpage URL")
     
-    parser.add_argument("--eval", action="store_true", help="Run evaluation mode")
+    parser.add_argument("--eval", type=str, nargs="?", const=None, help="Run evaluation mode with optional custom question")
     
     args = parser.parse_args()
     
@@ -362,8 +363,8 @@ def main():
         print(f"Reading webpage: {args.url}")
         text = read_webpage(args.url)
         print(f"\nPage Text (capped at 2000 chars):\n{text}")
-    elif args.eval:
-        run_evaluation()
+    elif args.eval is not None:
+        run_evaluation(eval_question=args.eval)
     else:
         run_agent()
 
