@@ -1,10 +1,13 @@
 import os
 import sys
 import time
+import json
 import argparse
 import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
+
+MAX_STEPS = 6
 
 def load_env():
     """Reads settings from a .env file."""
@@ -40,8 +43,9 @@ def search_web(query):
     except Exception as e:
         status_code = getattr(e, "response", None)
         status_code = getattr(status_code, "status_code", "Unknown")
-        print(f"Search failed | Status Code: {status_code} | URL/Query: {query} | Error: {e}")
-        return []
+        error_msg = f"Search failed | Status Code: {status_code} | Query: {query} | Error: {e}"
+        print(error_msg)
+        return {"error": error_msg}
     return results
 
 def read_webpage(url):
@@ -52,8 +56,9 @@ def read_webpage(url):
     try:
         response = requests.get(url, headers=headers, timeout=30)
         if response.status_code >= 400:
-            print(f"Page fetch failed | Status Code: {response.status_code} | URL: {url}")
-            return ""
+            error_msg = f"Page fetch failed | Status Code: {response.status_code} | URL: {url}"
+            print(error_msg)
+            return {"error": error_msg}
         
         soup = BeautifulSoup(response.text, "html.parser")
         
@@ -66,11 +71,51 @@ def read_webpage(url):
         status_code = "Unknown"
         if hasattr(e, "response") and e.response is not None:
             status_code = e.response.status_code
-        print(f"Page fetch failed | Status Code: {status_code} | URL: {url} | Error: {e}")
-        return ""
+        error_msg = f"Page fetch failed | Status Code: {status_code} | URL: {url} | Error: {e}"
+        print(error_msg)
+        return {"error": error_msg}
     except Exception as e:
-        print(f"Page fetch failed | Status Code: Unknown | URL: {url} | Error: {e}")
-        return ""
+        error_msg = f"Page fetch failed | Status Code: Unknown | URL: {url} | Error: {e}"
+        print(error_msg)
+        return {"error": error_msg}
+
+def call_llm_with_retry(endpoint, headers, payload):
+    max_retries = 3
+    attempt = 0
+    while attempt <= max_retries:
+        try:
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=60)
+            if response.status_code == 429:
+                attempt += 1
+                if attempt > max_retries:
+                    break
+                retry_after = response.headers.get("Retry-After")
+                wait_time = 2.0
+                if retry_after:
+                    try:
+                        wait_time = float(retry_after)
+                    except ValueError:
+                        pass
+                print(f"Rate limited (429). Waiting {wait_time} seconds before retry {attempt}/{max_retries}...")
+                time.sleep(wait_time)
+                continue
+            if 500 <= response.status_code < 600:
+                attempt += 1
+                if attempt > max_retries:
+                    break
+                wait_time = 2.0
+                print(f"Server error ({response.status_code}). Waiting {wait_time} seconds before retry {attempt}/{max_retries}...")
+                time.sleep(wait_time)
+                continue
+            if response.status_code >= 400:
+                print(f"Request failed with status code {response.status_code}: {response.text}")
+                sys.exit(1)
+            return response
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed: Error Type: {type(e).__name__}, Message: {e}")
+            sys.exit(1)
+    print("Request failed after max retries.")
+    sys.exit(1)
 
 def run_agent():
     env = load_env()
@@ -107,98 +152,132 @@ def run_agent():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Content-Type": "application/json"
     }
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "user", "content": research_question}
+    
+    state = []
+    
+    system_prompt = (
+        f"You are an expert research agent. You have a maximum of {MAX_STEPS} steps to complete the research goal.\n"
+        "You have access to three tools / actions:\n"
+        "1. SEARCH: Search the web for information using DuckDuckGo. Pass 'query'.\n"
+        "2. READ: Fetch a web page given its URL, strip HTML, and return visible text (note that page text may contain navigation and menus). Pass 'url'.\n"
+        "3. FINISH: Conclude the research when you have sufficient information. Pass 'report'.\n\n"
+        "On each step, reply with ONLY a JSON object (you may wrap it in markdown code fences like ```json ... ```) in one of these three shapes:\n"
+        '{"reason": "one short sentence", "action": "SEARCH", "query": "..."}\n'
+        '{"reason": "one short sentence", "action": "READ", "url": "..."}\n'
+        '{"reason": "one short sentence", "action": "FINISH", "report": "..."}'
+    )
+    
+    for step in range(1, MAX_STEPS + 1):
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Research Goal: {research_question}"}
         ]
-    }
-    
-    max_retries = 3
-    attempt = 0
-    response = None
-    
-    while attempt <= max_retries:
+        
+        if state:
+            history_str = "History of actions and observations so far:\n" + json.dumps(state, indent=2)
+            messages.append({"role": "user", "content": history_str})
+            
+        messages.append({"role": "user", "content": f"Step {step} of {MAX_STEPS}. Decide your next action and reply with ONLY the JSON object."})
+        
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.0
+        }
+        
+        response = call_llm_with_retry(endpoint, headers, payload)
+        
         try:
-            response = requests.post(endpoint, headers=headers, json=payload, timeout=60)
-            
-            if response.status_code == 429:
-                attempt += 1
-                if attempt > max_retries:
-                    break
-                retry_after = response.headers.get("Retry-After")
-                wait_time = 2.0
-                if retry_after:
-                    try:
-                        wait_time = float(retry_after)
-                    except ValueError:
-                        pass
-                print(f"Rate limited (429). Waiting {wait_time} seconds before retry {attempt}/{max_retries}...")
-                time.sleep(wait_time)
-                continue
-                
-            if 500 <= response.status_code < 600:
-                attempt += 1
-                if attempt > max_retries:
-                    break
-                wait_time = 2.0
-                print(f"Server error ({response.status_code}). Waiting {wait_time} seconds before retry {attempt}/{max_retries}...")
-                time.sleep(wait_time)
-                continue
-                
-            if response.status_code >= 400:
-                error_body = ""
-                try:
-                    error_body = response.text
-                except Exception:
-                    pass
-                print(f"Request failed with status code {response.status_code}:")
-                if error_body:
-                    print(f"  Response Body: {error_body}")
-                sys.exit(1)
-                
-            break
-            
-        except requests.exceptions.RequestException as e:
-            error_type = type(e).__name__
-            error_message = str(e)
-            response_body = ""
-            if hasattr(e, 'response') and e.response is not None:
-                try:
-                    response_body = e.response.text
-                except Exception:
-                    pass
-            print(f"Request failed:")
-            print(f"  Error Type: {error_type}")
-            print(f"  Message: {error_message}")
-            if response_body:
-                print(f"  Response Body: {response_body}")
+            data = response.json()
+            reply_text = data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"Error parsing LLM response structure: {e}")
+            print(f"Raw response: {response.text}")
             sys.exit(1)
             
-    if response is not None and (response.status_code == 429 or 500 <= response.status_code < 600):
-        print(f"Request failed after {max_retries} retries with status code {response.status_code}.")
+        clean_text = reply_text
+        if clean_text.startswith("```"):
+            lines = clean_text.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            clean_text = "\n".join(lines).strip()
+            
         try:
-            print(f"  Response Body: {response.text}")
-        except Exception:
-            pass
-        sys.exit(1)
+            action_data = json.loads(clean_text)
+        except Exception as e:
+            print(f"Error: Failed to parse JSON from model response.")
+            print(f"Raw reply:\n{reply_text}")
+            sys.exit(1)
+            
+        reason = action_data.get("reason", "")
+        action = action_data.get("action", "")
         
-    try:
-        data = response.json()
-    except Exception as e:
-        print(f"Error Type: JSONDecodeError")
-        print(f"Message: Failed to parse JSON response: {e}")
-        print(f"Response Body: {response.text}")
-        sys.exit(1)
+        observation = None
+        obs_summary = ""
         
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        print("Error: The reply does not contain choices[0].message.content.")
-        print(f"Full Response Body:\n{response.text}")
-        sys.exit(1)
+        if action == "SEARCH":
+            query = action_data.get("query", "")
+            observation = search_web(query)
+            if isinstance(observation, dict) and "error" in observation:
+                obs_summary = f"Search failed: {observation['error']}"
+            else:
+                obs_summary = f"Found {len(observation)} search results."
+        elif action == "READ":
+            url = action_data.get("url", "")
+            observation = read_webpage(url)
+            if isinstance(observation, dict) and "error" in observation:
+                obs_summary = f"Page read failed: {observation['error']}"
+            else:
+                obs_summary = f"Fetched {len(observation)} characters of webpage text."
+        elif action == "FINISH":
+            report = action_data.get("report", "")
+            observation = {"report": report}
+            obs_summary = "Research finished."
+            
+            print(f"Step {step}: Reason: {reason} | Action: {action} | Observation: {obs_summary}")
+            print(f"\n================ RESEARCH BRIEF ================")
+            print(f"Question:\n{research_question}\n")
+            print(f"Findings:\n{report}\n")
+            print(f"Comparison:\n(Synthesized from research findings above)\n")
+            print(f"Recommendation:\n(Based on synthesized findings)\n")
+            print(f"Sources:")
+            seen_sources = set()
+            for s in state:
+                if s.get("action") == "SEARCH":
+                    res = s.get("result", [])
+                    if isinstance(res, list):
+                        for item in res:
+                            if isinstance(item, dict) and item.get("url"):
+                                url_item = item.get('url')
+                                if url_item not in seen_sources:
+                                    seen_sources.add(url_item)
+                                    print(f"- {item.get('title', 'Source')}: {url_item}")
+                elif s.get("action") == "READ":
+                    url_val = s.get("url")
+                    if url_val and url_val not in seen_sources:
+                        seen_sources.add(url_val)
+                        print(f"- Webpage: {url_val}")
+            print(f"================================================")
+            return
+        else:
+            obs_summary = f"Unknown action: {action}"
+            observation = {"error": obs_summary}
+            
+        print(f"Step {step}: Reason: {reason} | Action: {action} | Observation: {obs_summary}")
         
-    print(f"Research Result:\n{content}")
+        state_entry = {
+            "step": step,
+            "reason": reason,
+            "action": action,
+            "query": action_data.get("query"),
+            "url": action_data.get("url"),
+            "result": observation
+        }
+        state.append(state_entry)
+        
+    print(f"\nThe step limit ({MAX_STEPS}) ran out before FINISH.")
 
 def main():
     parser = argparse.ArgumentParser(description="Research Agent CLI")
